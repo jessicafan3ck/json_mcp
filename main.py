@@ -12,15 +12,14 @@ class RPCRequest(BaseModel):
     method: str
     params: dict = {}
 
-@app.post("/run")
+@app.post("/run", response_model=ExecuteResponse)
 async def run_rpc(req: RPCRequest):
     raw = await server.handle_mcp_request(req.dict())
-    # Assuming raw has your actual payload, e.g. the list of tools
-    return {
-        "status": "success",
-        "outputs": raw,
-        "artifacts": []
-    }
+    return ExecuteResponse(
+        status="success",
+        outputs=raw,
+        artifacts=[]
+    )
 
 @app.get("/healthz")
 def health():
