@@ -12,7 +12,7 @@ import http.server
 import socketserver
 from pathlib import Path
 
-class SimpleExecutionMCPServer:
+class CodeExecutionMCPServer:
     def __init__(self):
         self.max_execution_time = 30
         self.max_memory_mb = 512
