@@ -14,10 +14,13 @@ class RPCRequest(BaseModel):
 
 @app.post("/run")
 async def run_rpc(req: RPCRequest):
-    payload = req.dict()
-    # delegate to your MCP server
-    result = await server.handle_mcp_request(payload)
-    return result
+    raw = await server.handle_mcp_request(req.dict())
+    # Assuming raw has your actual payload, e.g. the list of tools
+    return {
+        "status": "success",
+        "outputs": raw,
+        "artifacts": []
+    }
 
 @app.get("/healthz")
 def health():
