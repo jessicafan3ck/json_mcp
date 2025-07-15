@@ -1,19 +1,22 @@
-import asyncio
-import json
 import subprocess
 import tempfile
+import sys
 import os
-import uuid
-from typing import Dict, Any, Optional
-import docker
+import signal
+import asyncio
+from typing import Dict, Any
+import resource
 import threading
 import time
+import http.server
+import socketserver
 from pathlib import Path
 
-class CodeExecutionMCPServer:
+class SimpleExecutionMCPServer:
     def __init__(self):
-        self.docker_client = docker.from_env()
-        self.running_containers = {}
+        self.max_execution_time = 30
+        self.max_memory_mb = 512
+        self.running_servers = {}
         
     async def handle_mcp_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Main MCP request handler"""
@@ -28,7 +31,6 @@ class CodeExecutionMCPServer:
             return {"error": f"Unknown method: {method}"}
     
     def list_tools(self) -> Dict[str, Any]:
-        """List available execution tools"""
         return {
             "tools": [
                 {
@@ -38,58 +40,33 @@ class CodeExecutionMCPServer:
                         "type": "object",
                         "properties": {
                             "code": {"type": "string"},
-                            "packages": {"type": "array", "items": {"type": "string"}, "optional": True}
+                            "timeout": {"type": "integer", "optional": True, "default": 30}
                         },
                         "required": ["code"]
                     }
                 },
                 {
                     "name": "execute_javascript",
-                    "description": "Execute JavaScript/Node.js code",
+                    "description": "Execute JavaScript code with Node.js",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "code": {"type": "string"},
-                            "packages": {"type": "array", "items": {"type": "string"}, "optional": True}
+                            "timeout": {"type": "integer", "optional": True, "default": 30}
                         },
                         "required": ["code"]
                     }
                 },
                 {
                     "name": "serve_html",
-                    "description": "Serve HTML content with live preview",
+                    "description": "Serve HTML content on local server",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "html": {"type": "string"},
-                            "port": {"type": "integer", "optional": True}
+                            "port": {"type": "integer", "optional": True, "default": 8080}
                         },
                         "required": ["html"]
-                    }
-                },
-                {
-                    "name": "serve_react",
-                    "description": "Build and serve React component",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "component": {"type": "string"},
-                            "port": {"type": "integer", "optional": True}
-                        },
-                        "required": ["component"]
-                    }
-                },
-                {
-                    "name": "execute_visualization",
-                    "description": "Execute data visualization code (matplotlib, plotly, etc.)",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "code": {"type": "string"},
-                            "library": {"type": "string", "enum": ["matplotlib", "plotly", "seaborn", "bokeh"]},
-                            "output_format": {"type": "string", "enum": ["png", "svg", "html", "json"], "optional": True}
-                        },
-                        "required": ["code", "library"]
                     }
                 }
             ]
@@ -107,359 +84,290 @@ class CodeExecutionMCPServer:
                 return await self.execute_javascript(arguments)
             elif tool_name == "serve_html":
                 return await self.serve_html(arguments)
-            elif tool_name == "serve_react":
-                return await self.serve_react(arguments)
-            elif tool_name == "execute_visualization":
-                return await self.execute_visualization(arguments)
             else:
                 return {"error": f"Unknown tool: {tool_name}"}
         except Exception as e:
-            return {"error": f"Execution failed: {str(e)}"}
+            return {"error": f"Tool execution failed: {str(e)}"}
     
     async def execute_python(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute Python code in Docker container"""
+        """Execute Python code in subprocess"""
         code = args["code"]
-        packages = args.get("packages", [])
+        timeout = args.get("timeout", self.max_execution_time)
         
-        # Create Dockerfile content
-        dockerfile_content = f"""
-FROM python:3.9-slim
-RUN pip install numpy pandas matplotlib plotly seaborn {' '.join(packages)}
-WORKDIR /app
-COPY script.py .
-CMD ["python", "script.py"]
+        # Add memory and import restrictions for safety
+        safe_code = f"""
+import resource
+import sys
+
+# Set memory limit
+resource.setrlimit(resource.RLIMIT_AS, ({self.max_memory_mb * 1024 * 1024}, {self.max_memory_mb * 1024 * 1024}))
+
+# Block dangerous imports
+blocked_modules = {{'subprocess', 'os', 'shutil', 'socket', 'urllib', 'requests', 'pickle'}}
+original_import = __builtins__.__import__
+
+def safe_import(name, *args, **kwargs):
+    if name in blocked_modules:
+        raise ImportError(f"Import of '{{name}}' is blocked for security")
+    return original_import(name, *args, **kwargs)
+
+__builtins__.__import__ = safe_import
+
+# User code starts here
+{code}
 """
         
-        # Create temporary directory
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Write code to file
-            with open(f"{temp_dir}/script.py", "w") as f:
-                f.write(code)
+        # Write to temp script
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(safe_code)
+            script_path = f.name
+        
+        try:
+            # Run it with timeout and resource limits
+            proc = subprocess.run(
+                [sys.executable, script_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=tempfile.gettempdir()
+            )
             
-            # Write Dockerfile
-            with open(f"{temp_dir}/Dockerfile", "w") as f:
-                f.write(dockerfile_content)
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Return code: {proc.returncode}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+                    }
+                ]
+            }
             
-            # Build and run container
-            try:
-                image = self.docker_client.images.build(
-                    path=temp_dir,
-                    tag=f"python-exec-{uuid.uuid4().hex[:8]}"
-                )[0]
-                
-                container = self.docker_client.containers.run(
-                    image.id,
-                    remove=True,
-                    stdout=True,
-                    stderr=True,
-                    timeout=30
-                )
-                
-                output = container.decode('utf-8')
-                
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Python execution completed:\n\n{output}"
-                        }
-                    ]
-                }
-                
-            except Exception as e:
-                return {"error": f"Docker execution failed: {str(e)}"}
+        except subprocess.TimeoutExpired:
+            return {"error": f"Python execution timed out after {timeout} seconds"}
+        except Exception as e:
+            return {"error": f"Python execution failed: {str(e)}"}
+        finally:
+            # Clean up temp file
+            if os.path.exists(script_path):
+                os.unlink(script_path)
     
     async def execute_javascript(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute JavaScript code in Node.js container"""
+        """Execute JavaScript code with Node.js"""
         code = args["code"]
-        packages = args.get("packages", [])
+        timeout = args.get("timeout", self.max_execution_time)
         
-        package_json = {
-            "name": "js-execution",
-            "version": "1.0.0",
-            "dependencies": {pkg: "latest" for pkg in packages}
-        }
-        
-        dockerfile_content = f"""
-FROM node:16-slim
-WORKDIR /app
-COPY package.json .
-RUN npm install
-COPY script.js .
-CMD ["node", "script.js"]
+        # Add basic safety wrapper
+        safe_code = f"""
+// Set timeout for execution
+setTimeout(() => {{
+    console.error('Script timed out');
+    process.exit(1);
+}}, {timeout * 1000});
+
+// Block dangerous modules
+const originalRequire = require;
+const blockedModules = ['fs', 'child_process', 'net', 'http', 'https', 'crypto'];
+
+require = function(module) {{
+    if (blockedModules.includes(module)) {{
+        throw new Error(`Module '${{module}}' is blocked for security`);
+    }}
+    return originalRequire(module);
+}};
+
+// User code starts here
+{code}
 """
         
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with open(f"{temp_dir}/script.js", "w") as f:
-                f.write(code)
+        # Write to temp script
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(safe_code)
+            script_path = f.name
+        
+        try:
+            # Check if Node.js is available
+            node_check = subprocess.run(
+                ["node", "--version"],
+                capture_output=True,
+                timeout=5
+            )
             
-            with open(f"{temp_dir}/package.json", "w") as f:
-                json.dump(package_json, f)
+            if node_check.returncode != 0:
+                return {"error": "Node.js not found. Please install Node.js to execute JavaScript."}
             
-            with open(f"{temp_dir}/Dockerfile", "w") as f:
-                f.write(dockerfile_content)
+            # Run JavaScript with Node.js
+            proc = subprocess.run(
+                ["node", script_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=tempfile.gettempdir()
+            )
             
-            try:
-                image = self.docker_client.images.build(
-                    path=temp_dir,
-                    tag=f"js-exec-{uuid.uuid4().hex[:8]}"
-                )[0]
-                
-                container = self.docker_client.containers.run(
-                    image.id,
-                    remove=True,
-                    stdout=True,
-                    stderr=True,
-                    timeout=30
-                )
-                
-                output = container.decode('utf-8')
-                
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"JavaScript execution completed:\n\n{output}"
-                        }
-                    ]
-                }
-                
-            except Exception as e:
-                return {"error": f"Docker execution failed: {str(e)}"}
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Return code: {proc.returncode}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+                    }
+                ]
+            }
+            
+        except subprocess.TimeoutExpired:
+            return {"error": f"JavaScript execution timed out after {timeout} seconds"}
+        except Exception as e:
+            return {"error": f"JavaScript execution failed: {str(e)}"}
+        finally:
+            # Clean up temp file
+            if os.path.exists(script_path):
+                os.unlink(script_path)
     
     async def serve_html(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Serve HTML content on a web server"""
+        """Serve HTML content on local server"""
         html_content = args["html"]
         port = args.get("port", 8080)
         
-        dockerfile_content = f"""
-FROM nginx:alpine
-COPY index.html /usr/share/nginx/html/
-EXPOSE {port}
-CMD ["nginx", "-g", "daemon off;"]
-"""
+        # Create temp directory for serving
+        temp_dir = tempfile.mkdtemp()
+        html_path = os.path.join(temp_dir, "index.html")
         
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with open(f"{temp_dir}/index.html", "w") as f:
+        try:
+            # Write HTML to file
+            with open(html_path, "w") as f:
                 f.write(html_content)
             
-            with open(f"{temp_dir}/Dockerfile", "w") as f:
-                f.write(dockerfile_content)
+            # Start HTTP server in background thread
+            def start_server():
+                os.chdir(temp_dir)
+                handler = http.server.SimpleHTTPRequestHandler
+                
+                # Try to bind to the port
+                try:
+                    with socketserver.TCPServer(("", port), handler) as httpd:
+                        self.running_servers[port] = httpd
+                        httpd.serve_forever()
+                except OSError as e:
+                    print(f"Port {port} already in use: {e}")
             
-            try:
-                image = self.docker_client.images.build(
-                    path=temp_dir,
-                    tag=f"html-serve-{uuid.uuid4().hex[:8]}"
-                )[0]
-                
-                container = self.docker_client.containers.run(
-                    image.id,
-                    ports={f'{port}/tcp': port},
-                    detach=True,
-                    remove=True
-                )
-                
-                container_id = container.id[:12]
-                self.running_containers[container_id] = container
-                
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"HTML server started!\nAccess at: http://localhost:{port}\nContainer ID: {container_id}"
-                        }
-                    ]
-                }
-                
-            except Exception as e:
-                return {"error": f"Failed to serve HTML: {str(e)}"}
-    
-    async def serve_react(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Build and serve React component"""
-        component_code = args["component"]
-        port = args.get("port", 3000)
-        
-        # Create a basic React app structure
-        package_json = {
-            "name": "react-component",
-            "version": "1.0.0",
-            "dependencies": {
-                "react": "^18.0.0",
-                "react-dom": "^18.0.0",
-                "react-scripts": "5.0.1"
-            },
-            "scripts": {
-                "start": "react-scripts start",
-                "build": "react-scripts build"
+            # Start server in background
+            server_thread = threading.Thread(target=start_server, daemon=True)
+            server_thread.start()
+            
+            # Give server time to start
+            await asyncio.sleep(1)
+            
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"HTML server started!\nAccess your page at: http://localhost:{port}\nServing from: {temp_dir}"
+                    }
+                ]
             }
-        }
-        
-        app_js = f"""
-import React from 'react';
-import ReactDOM from 'react-dom/client';
-
-{component_code}
-
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(<App />);
-"""
-        
-        html_template = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>React Component</title>
-</head>
-<body>
-    <div id="root"></div>
-</body>
-</html>
-"""
-        
-        dockerfile_content = f"""
-FROM node:16-alpine
-WORKDIR /app
-COPY package.json .
-RUN npm install
-COPY public/ public/
-COPY src/ src/
-EXPOSE {port}
-CMD ["npm", "start"]
-"""
-        
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Create directory structure
-            os.makedirs(f"{temp_dir}/src")
-            os.makedirs(f"{temp_dir}/public")
             
-            with open(f"{temp_dir}/package.json", "w") as f:
-                json.dump(package_json, f)
-            
-            with open(f"{temp_dir}/src/index.js", "w") as f:
-                f.write(app_js)
-            
-            with open(f"{temp_dir}/public/index.html", "w") as f:
-                f.write(html_template)
-            
-            with open(f"{temp_dir}/Dockerfile", "w") as f:
-                f.write(dockerfile_content)
-            
-            try:
-                image = self.docker_client.images.build(
-                    path=temp_dir,
-                    tag=f"react-serve-{uuid.uuid4().hex[:8]}"
-                )[0]
-                
-                container = self.docker_client.containers.run(
-                    image.id,
-                    ports={f'{port}/tcp': port},
-                    detach=True,
-                    remove=True,
-                    environment={"PORT": str(port)}
-                )
-                
-                container_id = container.id[:12]
-                self.running_containers[container_id] = container
-                
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"React app building and starting...\nWill be available at: http://localhost:{port}\nContainer ID: {container_id}"
-                        }
-                    ]
-                }
-                
-            except Exception as e:
-                return {"error": f"Failed to serve React: {str(e)}"}
+        except Exception as e:
+            return {"error": f"Failed to serve HTML: {str(e)}"}
     
-    async def execute_visualization(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute visualization code and return image/HTML"""
-        code = args["code"]
-        library = args["library"]
-        output_format = args.get("output_format", "png")
-        
-        # Add code to save visualization
-        if library == "matplotlib":
-            code += f"\nimport matplotlib.pyplot as plt\nplt.savefig('/app/output.{output_format}')\nplt.close()"
-        elif library == "plotly":
-            if output_format == "html":
-                code += f"\nimport plotly.offline as pyo\npyo.plot(fig, filename='/app/output.html', auto_open=False)"
-            else:
-                code += f"\nfig.write_image('/app/output.{output_format}')"
-        
-        dockerfile_content = f"""
-FROM python:3.9-slim
-RUN pip install {library} pandas numpy
-WORKDIR /app
-COPY script.py .
-CMD ["python", "script.py"]
-"""
-        
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with open(f"{temp_dir}/script.py", "w") as f:
-                f.write(code)
-            
-            with open(f"{temp_dir}/Dockerfile", "w") as f:
-                f.write(dockerfile_content)
-            
-            try:
-                image = self.docker_client.images.build(
-                    path=temp_dir,
-                    tag=f"viz-exec-{uuid.uuid4().hex[:8]}"
-                )[0]
-                
-                container = self.docker_client.containers.run(
-                    image.id,
-                    remove=True,
-                    stdout=True,
-                    stderr=True,
-                    timeout=30
-                )
-                
-                # Get the output file from container
-                # In real implementation, you'd copy the file out
-                output = container.decode('utf-8')
-                
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Visualization created!\nOutput: {output}\nFile saved as output.{output_format}"
-                        }
-                    ]
-                }
-                
-            except Exception as e:
-                return {"error": f"Visualization failed: {str(e)}"}
+    def stop_server(self, port: int):
+        """Stop a running server"""
+        if port in self.running_servers:
+            self.running_servers[port].shutdown()
+            del self.running_servers[port]
+            return True
+        return False
 
-# Usage example
+# Usage example and test
 async def main():
-    server = CodeExecutionMCPServer()
+    server = SimpleExecutionMCPServer()
     
     # Test Python execution
+    print("Testing Python execution...")
     python_request = {
         "method": "tools/call",
         "params": {
             "name": "execute_python",
             "arguments": {
                 "code": """
-import numpy as np
-import matplotlib.pyplot as plt
+import math
+print("Hello from Python!")
+print(f"Pi is approximately {math.pi:.4f}")
 
-x = np.linspace(0, 10, 100)
-y = np.sin(x)
-
-print("Generated sine wave data")
-print(f"X range: {x.min():.2f} to {x.max():.2f}")
-print(f"Y range: {y.min():.2f} to {y.max():.2f}")
+# Test some computation
+numbers = [1, 2, 3, 4, 5]
+squared = [x**2 for x in numbers]
+print(f"Squared: {squared}")
+print(f"Sum of squares: {sum(squared)}")
 """
             }
         }
     }
     
     response = await server.handle_mcp_request(python_request)
-    print("Python execution:", response)
+    print("Python result:", response)
+    print()
+    
+    # Test JavaScript execution
+    print("Testing JavaScript execution...")
+    js_request = {
+        "method": "tools/call",
+        "params": {
+            "name": "execute_javascript",
+            "arguments": {
+                "code": """
+console.log("Hello from JavaScript!");
+console.log("Current time:", new Date().toISOString());
+
+// Test some computation
+const numbers = [1, 2, 3, 4, 5];
+const squared = numbers.map(x => x * x);
+console.log("Squared:", squared);
+console.log("Sum of squares:", squared.reduce((a, b) => a + b, 0));
+"""
+            }
+        }
+    }
+    
+    response = await server.handle_mcp_request(js_request)
+    print("JavaScript result:", response)
+    print()
+    
+    # Test HTML serving
+    print("Testing HTML serving...")
+    html_request = {
+        "method": "tools/call",
+        "params": {
+            "name": "serve_html",
+            "arguments": {
+                "html": """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Page</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        h1 { color: #333; }
+        .demo { background: #f0f0f0; padding: 20px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Hello from MCP HTML Server!</h1>
+    <div class="demo">
+        <p>This HTML was served by the MCP server.</p>
+        <p>Current time: <span id="time"></span></p>
+    </div>
+    
+    <script>
+        document.getElementById('time').textContent = new Date().toLocaleString();
+    </script>
+</body>
+</html>
+""",
+                "port": 8080
+            }
+        }
+    }
+    
+    response = await server.handle_mcp_request(html_request)
+    print("HTML server result:", response)
 
 if __name__ == "__main__":
     asyncio.run(main())
