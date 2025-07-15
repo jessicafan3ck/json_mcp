@@ -22,3 +22,12 @@ async def run_rpc(req: RPCRequest):
 @app.get("/healthz")
 def health():
     return {"status": "ok"}
+
+@app.get("/")
+async def read_root():
+    return {"message": "JSON‑RPC service is running."}
+
+@app.get("/favicon.ico")
+async def favicon():
+    return {}
+
