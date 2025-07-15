@@ -34,3 +34,15 @@ async def read_root():
 async def favicon():
     return {}
 
+from typing import Any, Dict, List
+from pydantic import BaseModel
+
+class ArtifactModel(BaseModel):
+    id: str
+    type: str
+    meta: Dict[str, Any]
+
+class ExecuteResponse(BaseModel):
+    status: str                  # "success" or "error"
+    outputs: Dict[str, Any]      # e.g. {"tools": [...]}
+    artifacts: List[ArtifactModel]
